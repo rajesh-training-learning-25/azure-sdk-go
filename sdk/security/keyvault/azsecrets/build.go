@@ -1,7 +1,8 @@
 //go:build go1.18
 // +build go1.18
 
-//go:generate autorest ./autorest.md
+//go:generate tsp-client update
+//go:generate go run ./internal/transforms.go
 //go:generate rm ./constants.go
 //go:generate gofmt -w .
 
