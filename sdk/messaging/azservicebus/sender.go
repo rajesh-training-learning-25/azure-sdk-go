@@ -10,6 +10,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/amqpwrap"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/tracing"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/utils"
 	"github.com/Azure/go-amqp"
 )
@@ -47,7 +48,7 @@ func (s *Sender) NewMessageBatch(ctx context.Context, options *MessageBatchOptio
 
 		batch = newMessageBatch(maxBytes)
 		return nil
-	}, s.retryOptions)
+	}, s.retryOptions, nil)
 
 	if err != nil {
 		return nil, internal.TransformError(err)
@@ -93,9 +94,10 @@ type SendMessageBatchOptions struct {
 // Message batches can be created using [Sender.NewMessageBatch].
 // If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (s *Sender) SendMessageBatch(ctx context.Context, batch *MessageBatch, options *SendMessageBatchOptions) error {
+	sc := tracing.NewSpanConfig(tracing.SendBatchSpanName, setSenderSpanAttributes(s.queueOrTopic, tracing.SendOperationName), setMessageBatchSpanAttributes(int(batch.NumMessages())))
 	err := s.links.Retry(ctx, EventSender, "SendMessageBatch", func(ctx context.Context, lwid *internal.LinksWithID, args *utils.RetryFnArgs) error {
 		return lwid.Sender.Send(ctx, batch.toAMQPMessage(), nil)
-	}, RetryOptions(s.retryOptions))
+	}, RetryOptions(s.retryOptions), sc)
 
 	return internal.TransformError(err)
 }
@@ -110,7 +112,8 @@ type ScheduleMessagesOptions struct {
 // delivered can be cancelled using `Receiver.CancelScheduleMessage(s)`
 // If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (s *Sender) ScheduleMessages(ctx context.Context, messages []*Message, scheduledEnqueueTime time.Time, options *ScheduleMessagesOptions) ([]int64, error) {
-	return scheduleMessages(ctx, s.links, s.retryOptions, messages, scheduledEnqueueTime)
+	sequenceNumbers, err := scheduleMessages(ctx, s.links, s.retryOptions, messages, scheduledEnqueueTime)
+	return sequenceNumbers, err
 }
 
 // ScheduleAMQPAnnotatedMessagesOptions contains optional parameters for the ScheduleAMQPAnnotatedMessages function.
@@ -123,10 +126,13 @@ type ScheduleAMQPAnnotatedMessagesOptions struct {
 // delivered can be cancelled using `Receiver.CancelScheduleMessage(s)`
 // If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (s *Sender) ScheduleAMQPAnnotatedMessages(ctx context.Context, messages []*AMQPAnnotatedMessage, scheduledEnqueueTime time.Time, options *ScheduleAMQPAnnotatedMessagesOptions) ([]int64, error) {
-	return scheduleMessages(ctx, s.links, s.retryOptions, messages, scheduledEnqueueTime)
+	sequenceNumbers, err := scheduleMessages(ctx, s.links, s.retryOptions, messages, scheduledEnqueueTime)
+	return sequenceNumbers, err
 }
 
 func scheduleMessages[T amqpCompatibleMessage](ctx context.Context, links internal.AMQPLinks, retryOptions RetryOptions, messages []T, scheduledEnqueueTime time.Time) ([]int64, error) {
+	sc := tracing.NewSpanConfig(tracing.ScheduleSpanName, setSenderSpanAttributes(links.EntityPath(), tracing.ScheduleOperationName), setMessageBatchSpanAttributes(len(messages)))
+
 	var amqpMessages []*amqp.Message
 
 	for _, m := range messages {
@@ -143,7 +149,7 @@ func scheduleMessages[T amqpCompatibleMessage](ctx context.Context, links intern
 		}
 		sequenceNumbers = sn
 		return nil
-	}, retryOptions)
+	}, retryOptions, sc)
 
 	return sequenceNumbers, internal.TransformError(err)
 }
@@ -158,9 +164,11 @@ type CancelScheduledMessagesOptions struct {
 // CancelScheduledMessages cancels multiple messages that were scheduled.
 // If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (s *Sender) CancelScheduledMessages(ctx context.Context, sequenceNumbers []int64, options *CancelScheduledMessagesOptions) error {
+	sc := tracing.NewSpanConfig(tracing.CancelScheduledSpanName, setSenderSpanAttributes(s.queueOrTopic, tracing.CancelScheduledOperationName), setMessageBatchSpanAttributes(len(sequenceNumbers)))
+
 	err := s.links.Retry(ctx, EventSender, "CancelScheduledMessages", func(ctx context.Context, lwv *internal.LinksWithID, args *utils.RetryFnArgs) error {
 		return internal.CancelScheduledMessages(ctx, lwv.RPC, lwv.Sender.LinkName(), sequenceNumbers)
-	}, s.retryOptions)
+	}, s.retryOptions, sc)
 
 	return internal.TransformError(err)
 }
@@ -172,9 +180,11 @@ func (s *Sender) Close(ctx context.Context) error {
 }
 
 func (s *Sender) sendMessage(ctx context.Context, message amqpCompatibleMessage) error {
+	sc := tracing.NewSpanConfig(tracing.SendSpanName, setSenderSpanAttributes(s.queueOrTopic, tracing.SendOperationName), setMessageSpanAttributes(message))
+
 	err := s.links.Retry(ctx, EventSender, "SendMessage", func(ctx context.Context, lwid *internal.LinksWithID, args *utils.RetryFnArgs) error {
 		return lwid.Sender.Send(ctx, message.toAMQPMessage(), nil)
-	}, RetryOptions(s.retryOptions))
+	}, RetryOptions(s.retryOptions), sc)
 
 	if amqpErr := (*amqp.Error)(nil); errors.As(err, &amqpErr) && amqpErr.Condition == amqp.ErrCondMessageSizeExceeded {
 		return ErrMessageTooLarge
@@ -200,6 +210,7 @@ func (sender *Sender) createSenderLink(ctx context.Context, session amqpwrap.AMQ
 }
 
 type newSenderArgs struct {
+	tracer         tracing.Tracer
 	ns             internal.NamespaceForAMQPLinks
 	queueOrTopic   string
 	cleanupOnClose func()
@@ -218,6 +229,7 @@ func newSender(args newSenderArgs) (*Sender, error) {
 	}
 
 	sender.links = internal.NewAMQPLinks(internal.NewAMQPLinksArgs{
+		Tracer:              args.tracer,
 		NS:                  args.ns,
 		EntityPath:          args.queueOrTopic,
 		CreateLinkFunc:      sender.createSenderLink,
