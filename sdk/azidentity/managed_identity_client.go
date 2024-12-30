@@ -380,7 +380,7 @@ func (c *managedIdentityClient) createAppServiceAuthRequest(ctx context.Context,
 		case miObjectID:
 			q.Set("principal_id", id.String())
 		case miResourceID:
-			q.Set(miResID, id.String())
+			q.Set(msiResID, id.String())
 		}
 	}
 	request.Raw().URL.RawQuery = q.Encode()
